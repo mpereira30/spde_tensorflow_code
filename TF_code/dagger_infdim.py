@@ -15,7 +15,8 @@ from time import time
 import configparser
 import sys
 from matplotlib import cm
-from os import path
+import matplotlib as mpl 
+from utils import extract_image_from_field
 
 np.random.seed(int(time()))
 config = configparser.RawConfigParser()
@@ -381,6 +382,7 @@ with tf.Session(config=config) as sess:
 
 			starttime = time()
 
+			# Query the expert:
 			for _ in range(iters):
 
 				U_current = sess.run(U_new,
