@@ -36,6 +36,9 @@ desired_temperature = np.float32(config.getfloat('sec1', 'desired_temperature'))
 fnn_layer_size = config.getint('sec1', 'fnn_layer_size')
 learning_rate = config.getfloat('sec1', 'learning_rate')
 batch_size_l = config.getint('sec1', 'batch_size_l')
+num_contour_levels = config.getint('sec1', 'num_contour_levels')
+vmin = config.getfloat('sec1', 'vmin')
+vmax = config.getfloat('sec1', 'vmax')
 
 Tsim_steps = np.int32(Tsim/dt) # total number of simulation timesteps
 T = np.int32(Tf/dt) # total number of MPC timesteps
@@ -63,6 +66,11 @@ height_pixels = image_height*dpi_val
 width_pixels = image_width*dpi_val
 channels = 3
 num_filters = 8
+
+X = np.arange(0, a+z, z)
+Y = np.arange(0, a+z, z)
+
+
 
 savepath="/home/mpereira30/spdes/TF_code/save_n_log"
 beta_values = [1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.45, 0.4, 0.35, 0.30, 0.25, 0.2, 0.18, 0.16, 0.14, 0.12, 0.10, 0.08, 0.06, 0.04, 0.02,  0.00, 0.00]
@@ -360,10 +368,11 @@ with tf.Session(config=config) as sess:
 	sess.run(tf.global_variables_initializer())
 	print("Initialize trainable variables")
 
-	for _iter_ in range(len(beta_values)):
+	# These lists hold all of the aggregated data in DAgger:
+	h0_images = []
+	expert_Us = []
 
-		h0s = []
-		expert_Us = []
+	for _iter_ in range(len(beta_values)):
 
 		beta = beta_values[_iter_]
 		print("Iteration number:", _iter_+1, ", beta = ", beta)
@@ -374,6 +383,7 @@ with tf.Session(config=config) as sess:
 
 		np.random.seed(int(time()))
 
+		# get initial states and intial control sequences for expert at the beginning of every episode:
 		h_current = init_sigma * np.random.rand(num_gpus,J-1,J-1)
 		U_current = np.random.randn(num_gpus,T,N)
 		print("")
@@ -382,13 +392,24 @@ with tf.Session(config=config) as sess:
 
 			starttime = time()
 
+			# Convert the input fields into images and store for training learner:
+			h_images = extract_image_from_field(h_current, image_height, image_width, dpi_val, X, Y, num_contour_levels, vmin, vmax)
+			for i in range(num_gpus):
+				h0_images.append(h_images[i,:,:,:])			
+
 			# Query the expert:
 			for _ in range(iters):
 
 				U_current = sess.run(U_new,
 				feed_dict={
-					h0_input_cpu: h_current,
-					U_input_cpu: U_current,
+				h0_input_cpu: h_current,
+				U_input_cpu: U_current,
+				})
+
+			# Query the learner:
+			U_learner = sess.run(output_leaf, 
+				feed_dict={
+				image_inputs_learner: np.expand_dims(h_images,1) # shape change from (ng,hpx,wpx,3) ---> (ng,bs,hpx,wpx,3)
 				})
 
 			# Apply control on actual system:	
