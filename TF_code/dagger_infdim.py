@@ -15,6 +15,7 @@ from time import time
 import configparser
 import sys
 from matplotlib import cm
+from os import path
 
 np.random.seed(int(time()))
 config = configparser.RawConfigParser()
@@ -33,6 +34,7 @@ epsilon = np.float32(config.getfloat('sec1', 'epsilon'))
 desired_temperature = np.float32(config.getfloat('sec1', 'desired_temperature'))
 fnn_layer_size = config.getint('sec1', 'fnn_layer_size')
 learning_rate = config.getfloat('sec1', 'learning_rate')
+batch_size_l = config.getint('sec1', 'batch_size_l')
 
 Tsim_steps = np.int32(Tsim/dt) # total number of simulation timesteps
 T = np.int32(Tf/dt) # total number of MPC timesteps
@@ -61,6 +63,9 @@ width_pixels = image_width*dpi_val
 channels = 3
 num_filters = 8
 
+savepath="/home/mpereira30/spdes/TF_code/save_n_log"
+beta_values = [1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.45, 0.4, 0.35, 0.30, 0.25, 0.2, 0.18, 0.16, 0.14, 0.12, 0.10, 0.08, 0.06, 0.04, 0.02,  0.00, 0.00]
+
 print("")
 print("-----------------------------Parameters-----------------------------")
 print("time discretization, dt:", dt, " seconds")
@@ -82,6 +87,7 @@ print("Considering terminal cost only? ", terminal_only)
 print("Noise sigma for simulating action on real system:", sigma_sys)
 print("Using", num_gpus, "GPUs")
 print("Sigma for initial field profile perturbation:", init_sigma)
+print("Learner batch size:", batch_size_l)
 print("--------------------------------------------------------------------")
 print("")
 
@@ -254,8 +260,8 @@ U_new = U_input_cpu + delta_U
 
 with tf.device('/CPU:0'):
 
-	expert_targets = tf.placeholder(tf.float32, [num_gpus, None, N])
-	image_inputs_learner = tf.placeholder(tf.float32, [num_gpus, None, height_pixels, width_pixels, channels]) 
+	expert_targets = tf.placeholder(tf.float32, [num_gpus, batch_size_l, N])
+	image_inputs_learner = tf.placeholder(tf.float32, [num_gpus, batch_size_l, height_pixels, width_pixels, channels]) 
 	
 	# unstack :
 	expert_targets_ = tf.unstack(expert_targets, axis=0)
@@ -316,9 +322,8 @@ with tf.variable_scope("CNN_learner", reuse=tf.AUTO_REUSE) as scope_PI :
 				O_B = tf.get_variable( name="output_layer_biases", shape=[1, N], dtype=tf.float32, initializer=tf.zeros_initializer() )	
 				
 				l1 = tf.tanh(tf.matmul(data, L1_W) + L1_B)
-				output = tf.matmul(l1, O_W) + O_B	
-				return output # shape of output will be (None, N)
-
+				return tf.matmul(l1, O_W) + O_B	
+				
 			output = FNN_policy(state_estmate)
 			scope_PI.reuse_variables()
 			gpu_output_control_sequences.append(output)
@@ -331,68 +336,87 @@ with tf.variable_scope("CNN_learner", reuse=tf.AUTO_REUSE) as scope_PI :
 
 numvars = len(tower_grads[0])
 averaged_grads = [None]*numvars
-output_leaf = gpu_output_control_sequences[-1]
+output_leaf = gpu_output_control_sequences
 
-#---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+tvars = tf.trainable_variables()
+print("Length of trainable variables list is:", len(tvars))
+total_variables = 0
+for _var in tvars:
+    print(_var)
+    mul = 1
+    vals = _var.get_shape().as_list()
+    for v in vals:
+        mul *= v
+    total_variables += mul
+print("")
+print("Total number of trainable variables are = ", total_variables)
+
+#----------------------------------------------------------------------------------TF session------------------------------------------------------------------------------------------------------
 
 config = tf.ConfigProto(allow_soft_placement=True)
 with tf.Session(config=config) as sess:
 
-	h_current = init_sigma * np.random.rand(num_gpus,J-1,J-1)
-	U_current = np.random.randn(num_gpus,T,N)
-	print("")
+	sess.run(tf.global_variables_initializer())
+	print("Initialize trainable variables")
 
-	all_cost = np.zeros((num_gpus,Tsim_steps))
-	for t_sim in range(Tsim_steps):
+	for _iter_ in range(len(beta_values)):
 
-		starttime = time()
+		h0s = []
+		expert_Us = []
 
-		for _ in range(iters):
+		beta = beta_values[_iter_]
+		print("Iteration number:", _iter_+1, ", beta = ", beta)
+		f = open(savepath+"train_logs.txt","a")
+		f.write("\n")
+		f.write("Iteration number:"+str(_iter_)+", beta = "+str(beta)+"\n")
+		f.close()		
 
-			U_current = sess.run(U_new,
-			feed_dict={
-				h0_input_cpu: h_current,
-				U_input_cpu: U_current,
-			})
+		np.random.seed(int(time()))
 
-		endtime_1 = time()
+		h_current = init_sigma * np.random.rand(num_gpus,J-1,J-1)
+		U_current = np.random.randn(num_gpus,T,N)
+		print("")
 
-		# Apply control on actual system:	
-		batch_costs = []
-		for bs in range(num_gpus):
-			h_vec = np.reshape(h_current[bs,:,:].T, [-1,1]) # vec operation
-			v_n = np.dot(np.expand_dims(np.squeeze(U_current[bs,0,:]),0), curly_v_tilde).T # operation : (1 x N) x (N x (J-1)*(J-1)) ---(after transpose)---> ((J-1)*(J-1) x 1)
-			dW_actual = sigma_sys * (2.0 * np.sqrt(dt)/a) * 0.5 * dst(0.5*dst(np.random.randn(J-1,J-1), type=1).T, type=1).T
-			dW_vec = np.reshape(dW_actual.T, [-1,1])
-			h_new = EE_inv.dot(h_vec + v_n*dt + dW_vec) # Propagate system 
-			h_current[bs,:,:] = np.reshape(h_new, (J-1,J-1)).T # Convert from vec to 2D mat for next timestep
-			U_current[bs,:,:] = np.concatenate((U_current[bs,1:,:], np.expand_dims(U_current[bs,-1,:],0)), axis=0) # Warm-start
+		for t_sim in range(Tsim_steps):
 
-			cost = 0
-			for i in range(len(r_x1)):
-				cost = cost + scale_factor * np.sum(np.square(h_d[ r_y1[i]:r_y2[i]+1, r_x1[i]:r_x2[i]+1 ] - h_current[bs, r_y1[i]:r_y2[i]+1, r_x1[i]:r_x2[i]+1 ]))
-			batch_costs.append(cost)
-		batch_costs = np.asarray(batch_costs)
-		
-		endtime_2 = time()
+			starttime = time()
 
-		sys.stdout.write("step:{} of {}, c1: {:3f}, c2: {:3f}, c3: {:3f}, c4: {:3f}, c5: {:3f}, c6: {:3f}, c7: {:3f}, c8: {:3f}, iter time: {:.5f}\r".format(t_sim+1, Tsim_steps, 
-						 	    batch_costs[0],\
-						 	    batch_costs[1],\
-						 	    batch_costs[2],\
-						 	    batch_costs[3],\
-						 	    batch_costs[4],\
-						 	    batch_costs[5],\
-						 	    batch_costs[6],\
-						 	    batch_costs[7],\
-						 	    endtime_1 - starttime))
-		sys.stdout.flush()
-		
-		all_cost[:,t_sim] = batch_costs
+			for _ in range(iters):
 
-np.savez('data2plot.npz', all_cost=all_cost)
-plt.figure()
-plt.plot(all_cost.T)
-plt.title('Cost vs timesteps')
-plt.show()
+				U_current = sess.run(U_new,
+				feed_dict={
+					h0_input_cpu: h_current,
+					U_input_cpu: U_current,
+				})
 
+			# Apply control on actual system:	
+			batch_costs = []
+			for bs in range(num_gpus):
+				h_vec = np.reshape(h_current[bs,:,:].T, [-1,1]) # vec operation
+				v_n = np.dot(np.expand_dims(np.squeeze(U_current[bs,0,:]),0), curly_v_tilde).T # operation : (1 x N) x (N x (J-1)*(J-1)) ---(after transpose)---> ((J-1)*(J-1) x 1)
+				dW_actual = sigma_sys * (2.0 * np.sqrt(dt)/a) * 0.5 * dst(0.5*dst(np.random.randn(J-1,J-1), type=1).T, type=1).T
+				dW_vec = np.reshape(dW_actual.T, [-1,1])
+				h_new = EE_inv.dot(h_vec + v_n*dt + dW_vec) # Propagate system 
+				h_current[bs,:,:] = np.reshape(h_new, (J-1,J-1)).T # Convert from vec to 2D mat for next timestep
+				U_current[bs,:,:] = np.concatenate((U_current[bs,1:,:], np.expand_dims(U_current[bs,-1,:],0)), axis=0) # Warm-start
+
+				cost = 0
+				for i in range(len(r_x1)):
+					cost = cost + scale_factor * np.sum(np.square(h_d[ r_y1[i]:r_y2[i]+1, r_x1[i]:r_x2[i]+1 ] - h_current[bs, r_y1[i]:r_y2[i]+1, r_x1[i]:r_x2[i]+1 ]))
+				batch_costs.append(cost)
+			batch_costs = np.asarray(batch_costs)
+			
+			endtime_2 = time()
+
+			sys.stdout.write("step:{} of {}, c1: {:3f}, c2: {:3f}, c3: {:3f}, c4: {:3f}, c5: {:3f}, c6: {:3f}, c7: {:3f}, c8: {:3f}, iter time: {:.5f}\r".format(t_sim+1, Tsim_steps, 
+							 	    batch_costs[0],\
+							 	    batch_costs[1],\
+							 	    batch_costs[2],\
+							 	    batch_costs[3],\
+							 	    batch_costs[4],\
+							 	    batch_costs[5],\
+							 	    batch_costs[6],\
+							 	    batch_costs[7],\
+							 	    endtime_1 - starttime))
+			sys.stdout.flush()
+			
