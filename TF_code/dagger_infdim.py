@@ -17,6 +17,7 @@ import sys
 from matplotlib import cm
 import matplotlib as mpl 
 from utils import extract_image_from_field
+import _pickle as cPickle
 
 np.random.seed(int(time()))
 config = configparser.RawConfigParser()
@@ -39,6 +40,7 @@ batch_size_l = config.getint('sec1', 'batch_size_l')
 num_contour_levels = config.getint('sec1', 'num_contour_levels')
 vmin = config.getfloat('sec1', 'vmin')
 vmax = config.getfloat('sec1', 'vmax')
+num_train_epochs = config.getint('sec1', 'num_train_epochs')
 
 Tsim_steps = np.int32(Tsim/dt) # total number of simulation timesteps
 T = np.int32(Tf/dt) # total number of MPC timesteps
@@ -59,21 +61,27 @@ terminal_only = False
 sigma_sys = 0.2
 precompute = False
 
-image_width = 5
-image_height = 5
+image_width = 1
+image_height = 1
 dpi_val = 100
-height_pixels = image_height*dpi_val
-width_pixels = image_width*dpi_val
-channels = 3
-num_filters = 8
+height_pixels = 77
+width_pixels = 77
+greyscale = False
+if greyscale:
+	channels = 1
+else:
+	channels = 3
 
+num_filters = [8, 16, 32, 64]
 X = np.arange(0, a+z, z)
 Y = np.arange(0, a+z, z)
 
-
-
 savepath="/home/mpereira30/spdes/TF_code/save_n_log"
-beta_values = [1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.45, 0.4, 0.35, 0.30, 0.25, 0.2, 0.18, 0.16, 0.14, 0.12, 0.10, 0.08, 0.06, 0.04, 0.02,  0.00, 0.00]
+
+pretrain_epochs = 10
+
+beta_values = [1.0] * pretrain_epochs + [0.95, 0.9, 0.85, 0.8, 0.75, 0.7, 0.6, 0.5, 0.4, 0.30, 0.25, 0.2, 0.15, 0.1, 0.05, 0.02, 0.0]
+print(beta_values)
 
 print("")
 print("-----------------------------Parameters-----------------------------")
@@ -97,6 +105,9 @@ print("Noise sigma for simulating action on real system:", sigma_sys)
 print("Using", num_gpus, "GPUs")
 print("Sigma for initial field profile perturbation:", init_sigma)
 print("Learner batch size:", batch_size_l)
+print("Number of DAgger iterations:", len(beta_values))
+print("Number of filters:", num_filters)
+print("Use greyscale images?", greyscale)
 print("--------------------------------------------------------------------")
 print("")
 
@@ -270,7 +281,7 @@ U_new = U_input_cpu + delta_U
 with tf.device('/CPU:0'):
 
 	expert_targets = tf.placeholder(tf.float32, [num_gpus, batch_size_l, N])
-	image_inputs_learner = tf.placeholder(tf.float32, [num_gpus, batch_size_l, height_pixels, width_pixels, channels]) 
+	image_inputs_learner = tf.placeholder(tf.float32, [num_gpus, None, height_pixels, width_pixels, channels]) 
 	
 	# unstack :
 	expert_targets_ = tf.unstack(expert_targets, axis=0)
@@ -288,6 +299,10 @@ with tf.variable_scope("CNN_learner", reuse=tf.AUTO_REUSE) as scope_PI :
 
 			# Some notes on conv nets:
 			# strides = [1, 1, 1, 1] applies the filter to a patch at every offset, strides = [1, 2, 2, 1] applies the filter to every other image patch in each dimension
+			
+			# formula for pooling layer : 
+			# w2 = (w1 - f)/S + 1
+			# h2 = (h1 - f)/S + 1			
 
 			def conv_relu(input, kernel_shape, bias_shape):
 			    # Create variable named "weights".
@@ -300,32 +315,34 @@ with tf.variable_scope("CNN_learner", reuse=tf.AUTO_REUSE) as scope_PI :
 			def process_batch_input_images(images, cnn_string):
 				with tf.variable_scope(cnn_string+"conv_1"):
 				    # Variables created here will be named "conv1/weights", "conv1/biases".
-				    relu1 = conv_relu(images, [3,3,channels,num_filters], [num_filters]) # (-1,hpx,wpx,nf)
-				    pool1 = tf.layers.max_pooling2d(inputs=relu1, pool_size=[2, 2], strides=2) # (-1,hpx/2,wpx/2,nf)    
+				    relu1 = conv_relu(images, [3,3,channels,num_filters[0]], [num_filters[0]]) # (-1,hpx,wpx,nf_0)
+				    pool1 = tf.layers.max_pooling2d(inputs=relu1, pool_size=[2, 2], strides=2) # (-1,hpx/2,wpx/2,nf_0)    
 				with tf.variable_scope(cnn_string+"conv_2"):
 				    # Variables created here will be named "conv2/weights", "conv2/biases".
-					relu2 = conv_relu(pool1, [2,2,num_filters,num_filters], [num_filters]) # (-1,hpx/2,wpx/2,nf)
-					pool2 = tf.layers.max_pooling2d(inputs=relu2, pool_size=[2, 2], strides=2) # (-1, hpx/4, wpx/4, nf)	
-					flat_size = int(height_pixels/4) * int(width_pixels/4) * num_filters 		    		
-					pool2_flat = tf.reshape(pool2, [-1, flat_size])
-					dense_W = tf.get_variable(name="denselayer_weights", shape=[flat_size, fnn_layer_size], dtype=tf.float32, initializer=tf.truncated_normal_initializer())	
-					dense_b = tf.get_variable(name="denselayer_biases", shape=[fnn_layer_size], dtype=tf.float32, initializer=tf.constant_initializer(0.0))	
-				return tf.nn.relu(tf.matmul(pool2_flat, dense_W) + dense_b)
+					relu2 = conv_relu(pool1, [3,3,num_filters[0],num_filters[1]], [num_filters[1]]) # (-1,hpx/2,wpx/2,nf_1)
+					pool2 = tf.layers.max_pooling2d(inputs=relu2, pool_size=[2, 2], strides=2) # (-1, hpx/4, wpx/4, nf_1)	
+				with tf.variable_scope(cnn_string+"conv_3"):
+				    # Variables created here will be named "conv3/weights", "conv3/biases".
+					relu3 = conv_relu(pool2, [3,3,num_filters[1],num_filters[2]], [num_filters[2]]) # (-1,hpx/4,wpx/4,nf_2)
+					pool3 = tf.layers.max_pooling2d(inputs=relu3, pool_size=[2, 2], strides=2) # (-1, hpx/8, wpx/8, nf_2)					
+				with tf.variable_scope(cnn_string+"conv_4"):
+				    # Variables created here will be named "conv3/weights", "conv3/biases".
+					relu4 = conv_relu(pool3, [3,3,num_filters[2],num_filters[3]], [num_filters[3]]) # (-1,hpx/8,wpx/8,nf_3)
+					pool4 = tf.layers.max_pooling2d(inputs=relu4, pool_size=[2, 2], strides=2) # (-1, hpx/16, wpx/16, nf_3)					
 
-			dense_output = process_batch_input_images(image_inputs_learner_[gpu_i], "CNN")
+					flat_size = int(height_pixels/16) * int(width_pixels/16) * num_filters[-1] 		    		
+					pool_flat = tf.reshape(pool4, [-1, flat_size])
+					fc_size = int(flat_size/8)
+					dense_W = tf.get_variable(name="denselayer_weights", shape=[flat_size, fc_size], dtype=tf.float32, initializer=tf.truncated_normal_initializer())	
+					dense_b = tf.get_variable(name="denselayer_biases", shape=[fc_size], dtype=tf.float32, initializer=tf.constant_initializer(0.0))	
+				return tf.nn.relu(tf.matmul(pool_flat, dense_W) + dense_b), fc_size
+
+			dense_output, fc_size  = process_batch_input_images(image_inputs_learner_[gpu_i], "CNN")
 	
-			state_estimate_output_W = tf.get_variable(name="state_estimate_output_weights", shape=[fnn_layer_size, fnn_layer_size], dtype=tf.float32, initializer=tf.truncated_normal_initializer())
-			state_estimate_output_b = tf.get_variable(name="state_estimate_output_biases", shape=[fnn_layer_size], dtype=tf.float32, initializer=tf.constant_initializer(0.0))			
-			state_estmate = tf.matmul(dense_output, state_estimate_output_W) + state_estimate_output_b
-
-			# formula for pooling layer : 
-			# w2 = (w1 - f)/S + 1
-			# h2 = (h1 - f)/S + 1
-
-			def FNN_policy(data): # shape of data is same as state_inputs_learner 
+			def FNN_policy(data, fc_size_): # shape of data is same as state_inputs_learner 
 
 				# No split:
-				L1_W = tf.get_variable(name="layer_1_weights", shape=[fnn_layer_size, fnn_layer_size], dtype=tf.float32, initializer=tf.truncated_normal_initializer())
+				L1_W = tf.get_variable(name="layer_1_weights", shape=[fc_size_, fnn_layer_size], dtype=tf.float32, initializer=tf.truncated_normal_initializer())
 				L1_B = tf.get_variable(name="layer_1_biases", shape=[fnn_layer_size], dtype=tf.float32, initializer=tf.zeros_initializer())
 				O_W = tf.get_variable( name="output_layer_weights", shape=[fnn_layer_size, N], dtype=tf.float32, initializer=tf.truncated_normal_initializer() )
 				O_B = tf.get_variable( name="output_layer_biases", shape=[1, N], dtype=tf.float32, initializer=tf.zeros_initializer() )	
@@ -333,7 +350,7 @@ with tf.variable_scope("CNN_learner", reuse=tf.AUTO_REUSE) as scope_PI :
 				l1 = tf.tanh(tf.matmul(data, L1_W) + L1_B)
 				return tf.matmul(l1, O_W) + O_B	
 				
-			output = FNN_policy(state_estmate)
+			output = FNN_policy(dense_output, fc_size)
 			scope_PI.reuse_variables()
 			gpu_output_control_sequences.append(output)
 
@@ -343,9 +360,25 @@ with tf.variable_scope("CNN_learner", reuse=tf.AUTO_REUSE) as scope_PI :
 			average_gpu_whole_loss.append(total_loss)
 			print("Built optimizer on GPU:", gpu_i)			
 
-numvars = len(tower_grads[0])
+numvars = len(tower_grads[0]) # tower_grads[0] is gradients list from 1st GPU
 averaged_grads = [None]*numvars
 output_leaf = gpu_output_control_sequences
+
+with tf.device('/GPU:0'):
+	
+	average_whole_loss = tf.reduce_mean(average_gpu_whole_loss)
+
+	for i in range(numvars):
+		grads_ = tower_grads[0][i][0] # initialize with gradients from 1st tower for ith variable
+		vars_ = tower_grads[0][i][1]
+		for j in range(1, num_gpus): 
+			grads_ = grads_ + tower_grads[j][i][0]
+		grads_ = tf.multiply(grads_, tf.constant((1/num_gpus), dtype=tf.float32))
+		averaged_grads[i] = tuple([grads_, vars_])
+	
+	train_step = adam_optimizer.apply_gradients(averaged_grads)
+	print("Built Adam optimizer with average Gradients on GPU:0")
+
 
 tvars = tf.trainable_variables()
 print("Length of trainable variables list is:", len(tvars))
@@ -361,7 +394,7 @@ print("")
 print("Total number of trainable variables are = ", total_variables)
 
 #----------------------------------------------------------------------------------TF session------------------------------------------------------------------------------------------------------
-
+saver = tf.train.Saver()  # Add ops to save and restore all the variables
 config = tf.ConfigProto(allow_soft_placement=True)
 with tf.Session(config=config) as sess:
 
@@ -375,6 +408,7 @@ with tf.Session(config=config) as sess:
 	for _iter_ in range(len(beta_values)):
 
 		beta = beta_values[_iter_]
+		print("")
 		print("Iteration number:", _iter_+1, ", beta = ", beta)
 		f = open(savepath+"train_logs.txt","a")
 		f.write("\n")
@@ -386,16 +420,39 @@ with tf.Session(config=config) as sess:
 		# get initial states and intial control sequences for expert at the beginning of every episode:
 		h_current = init_sigma * np.random.rand(num_gpus,J-1,J-1)
 		U_current = np.random.randn(num_gpus,T,N)
-		print("")
 
+		all_cost = np.zeros((num_gpus,Tsim_steps))
+		pick_expert_list = []
 		for t_sim in range(Tsim_steps):
 
 			starttime = time()
 
-			# Convert the input fields into images and store for training learner:
-			h_images = extract_image_from_field(h_current, image_height, image_width, dpi_val, X, Y, num_contour_levels, vmin, vmax)
-			for i in range(num_gpus):
-				h0_images.append(h_images[i,:,:,:])			
+			# Convert the input fields into images:
+			h_images = extract_image_from_field(h_current, image_height, image_width, dpi_val, X, Y, num_contour_levels, vmin, vmax, greyscale)
+			if greyscale: # add extra dimension for channels = 1
+				h_images = np.expand_dims(h_images, -1)
+			
+			print(h_images.dtype)			
+
+			h_diff = 0
+			w_diff = 0
+			if h_images.shape[1] != height_pixels:
+				if h_images.shape[1] < height_pixels:
+					h_diff = height_pixels - h_images.shape[1]
+					zeros_filler = np.zeros((h_images.shape[0], h_diff, h_images.shape[2], h_images.shape[3]), dtype='uint8')
+					h_images = np.concatenate((h_images, zeros_filler), 1)
+				else:
+					h_images = h_images[:,:height_pixels,:]
+			
+			if h_images.shape[2] != width_pixels:
+				if h_images.shape[2] < width_pixels:
+					w_diff = width_pixels - h_images.shape[2] 
+					zeros_filler = np.zeros((h_images.shape[0], h_images.shape[1], w_diff, h_images.shape[3]), dtype='uint8')
+					h_images = np.concatenate((h_images, zeros_filler), 2)
+				else:
+					h_images = h_images[:,:,:width_pixels]
+
+			print(h_images.dtype)
 
 			# Query the expert:
 			for _ in range(iters):
@@ -406,32 +463,48 @@ with tf.Session(config=config) as sess:
 				U_input_cpu: U_current,
 				})
 
+			# store data for training learner:
+			for i in range(num_gpus):
+				expert_Us.append(U_current[i,0,:])		
+				h0_images.append(h_images[i,:,:,:])			
+
 			# Query the learner:
-			U_learner = sess.run(output_leaf, 
+			cnn_output = sess.run(output_leaf, 
 				feed_dict={
 				image_inputs_learner: np.expand_dims(h_images,1) # shape change from (ng,hpx,wpx,3) ---> (ng,bs,hpx,wpx,3)
 				})
+			U_learner = np.squeeze(cnn_output) # final shape (ng,N)
 
+			pick_expert_prob = np.random.choice([1,0], size=1, p=[beta, (1.0-beta)])
+			pick_expert_list.append(pick_expert_prob)
+			if(pick_expert_prob):
+				u_mixed = U_current[:,0,:]
+			else:
+				u_mixed = U_learner	
+			
 			# Apply control on actual system:	
 			batch_costs = []
 			for bs in range(num_gpus):
 				h_vec = np.reshape(h_current[bs,:,:].T, [-1,1]) # vec operation
-				v_n = np.dot(np.expand_dims(np.squeeze(U_current[bs,0,:]),0), curly_v_tilde).T # operation : (1 x N) x (N x (J-1)*(J-1)) ---(after transpose)---> ((J-1)*(J-1) x 1)
+				v_n = np.dot(np.expand_dims(np.squeeze(u_mixed[bs,:]),0), curly_v_tilde).T # operation : (1 x N) x (N x (J-1)*(J-1)) ---(after transpose)---> ((J-1)*(J-1) x 1)
 				dW_actual = sigma_sys * (2.0 * np.sqrt(dt)/a) * 0.5 * dst(0.5*dst(np.random.randn(J-1,J-1), type=1).T, type=1).T
 				dW_vec = np.reshape(dW_actual.T, [-1,1])
 				h_new = EE_inv.dot(h_vec + v_n*dt + dW_vec) # Propagate system 
 				h_current[bs,:,:] = np.reshape(h_new, (J-1,J-1)).T # Convert from vec to 2D mat for next timestep
-				U_current[bs,:,:] = np.concatenate((U_current[bs,1:,:], np.expand_dims(U_current[bs,-1,:],0)), axis=0) # Warm-start
 
+				# Warm-start expert sequence for next timestep:
+				U_current[bs,:,:] = np.concatenate((U_current[bs,1:,:], np.expand_dims(U_current[bs,-1,:],0)), axis=0) 
+
+				# Compute cost of current timestep (and current batch element): FOR DEBUGGING
 				cost = 0
 				for i in range(len(r_x1)):
 					cost = cost + scale_factor * np.sum(np.square(h_d[ r_y1[i]:r_y2[i]+1, r_x1[i]:r_x2[i]+1 ] - h_current[bs, r_y1[i]:r_y2[i]+1, r_x1[i]:r_x2[i]+1 ]))
 				batch_costs.append(cost)
+
 			batch_costs = np.asarray(batch_costs)
 			
-			endtime_2 = time()
-
-			sys.stdout.write("step:{} of {}, c1: {:3f}, c2: {:3f}, c3: {:3f}, c4: {:3f}, c5: {:3f}, c6: {:3f}, c7: {:3f}, c8: {:3f}, iter time: {:.5f}\r".format(t_sim+1, Tsim_steps, 
+			endtime = time()
+			sys.stdout.write("step:{}/{}, c1:{:3f}, c2:{:3f}, c3:{:3f}, c4:{:3f}, c5:{:3f}, c6:{:3f}, c7:{:3f}, c8:{:3f}, i_t:{:3f}, hd:{:3f}, wd:{:3f}\r".format(t_sim+1, Tsim_steps, 
 							 	    batch_costs[0],\
 							 	    batch_costs[1],\
 							 	    batch_costs[2],\
@@ -440,6 +513,79 @@ with tf.Session(config=config) as sess:
 							 	    batch_costs[5],\
 							 	    batch_costs[6],\
 							 	    batch_costs[7],\
-							 	    endtime_1 - starttime))
+							 	    endtime - starttime,\
+							 	    h_diff,\
+							 	    w_diff))
 			sys.stdout.flush()
-			
+			all_cost[:,t_sim] = batch_costs
+
+		print("Sum of expert probability list:", sum(pick_expert_list))
+		fig_temp = plt.figure()
+		plt.plot(all_cost.T)
+		plt.savefig(savepath + '/plots/costs_' + str(_iter_+1) + '.png')
+		plt.close(fig_temp)
+
+		if _iter_ < pretrain_epochs:
+			print("Iter:", _iter_, "---> Pre-training stage. Saving data to picked files")
+			# f1 = open(savepath+"/pickles/h0_images.pickle", 'wb')
+			# cPickle.dump(h0_images, f1, cPickle.HIGHEST_PROTOCOL)
+			# f1.close()
+			# f2 = open(savepath+"/pickles/expert_Us.pickle", 'wb')
+			# cPickle.dump(expert_Us, f2, cPickle.HIGHEST_PROTOCOL)
+			# f2.close()
+			np.savez(savepath+"/pretrain.npz", h0_images=h0_images, expert_Us=expert_Us)
+
+		f = open(savepath+"train_logs.txt","a")
+		f.write("training learner on aggregated dataset of "+str(len(h0_images))+"data-ponits\n")		
+		print("\ntraining learner on aggregated dataset of "+str(len(h0_images))+" data-ponits\n")
+
+		epoch_idx = 0
+		while( epoch_idx < num_train_epochs ):	
+
+			np.random.seed(int(time()))	
+			random_indxs = np.random.choice(len(h0_images), len(h0_images), replace=False)	
+
+			training_images = []
+			training_targets = []
+			for i in range(len(h0_images)):
+				training_images.append(h0_images[random_indxs[i]])
+				training_targets.append(expert_Us[random_indxs[i]])
+
+			num_mini_batches = len(training_images)//batch_size_l
+			num_steps = num_mini_batches//num_gpus	
+			# With batch_size_l sized mini-batches and num_gpus how many steps do I need to consume the entire dataset? ---> num_steps 
+
+			input_image_array = np.zeros((num_gpus, batch_size_l, height_pixels, width_pixels, channels))
+			expert_targets_array = np.zeros((num_gpus, batch_size_l, N))
+
+			epoch_loss_list = []
+			for s in range(num_steps):
+
+				start_idx = s * batch_size_l * num_gpus
+
+				for sub_batch in range(num_gpus):
+					for bidx in range(batch_size_l):
+						input_image_array[sub_batch, bidx, :,:,:] = training_images[start_idx + bidx + sub_batch*batch_size_l]
+						expert_targets_array[sub_batch, bidx, :] = training_targets[start_idx + bidx + sub_batch*batch_size_l]
+
+				_total_loss, _ = sess.run([average_whole_loss, train_step], 
+					feed_dict={
+					image_inputs_learner: input_image_array,
+					expert_targets: expert_targets_array
+					})	
+							
+				epoch_loss_list.append(_total_loss)
+
+			if((epoch_idx+1)%100==0):
+				print("Epoch:", epoch_idx+1, "avg train loss:",sum(epoch_loss_list)/len(epoch_loss_list))
+				f.write("Epoch: "+str(epoch_idx+1)+", avg train loss: "+str(sum(epoch_loss_list)/len(epoch_loss_list))+"\n")				
+
+			epoch_idx = epoch_idx + 1
+		
+		f.write("\n")
+		f.close()
+
+	# Save policy weights:
+	save_path = savepath+'/tf_weights/dagger_policy.ckpt'		
+	saver.save(sess, save_path)
+	print("Saving weights to", save_path)

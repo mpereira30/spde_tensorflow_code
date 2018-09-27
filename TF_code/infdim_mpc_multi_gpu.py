@@ -15,6 +15,7 @@ from time import time
 import configparser
 import sys
 from matplotlib import cm
+from utils import extract_image_from_field
 
 np.random.seed(int(time()))
 config = configparser.RawConfigParser()
@@ -31,6 +32,9 @@ rho = np.float32(config.getfloat('sec1', 'rho'))
 scale_factor = config.getfloat('sec1', 'scale_factor')
 epsilon = np.float32(config.getfloat('sec1', 'epsilon'))
 desired_temperature = np.float32(config.getfloat('sec1', 'desired_temperature'))
+num_contour_levels = config.getint('sec1', 'num_contour_levels')
+vmin = config.getfloat('sec1', 'vmin')
+vmax = config.getfloat('sec1', 'vmax')
 
 Tsim_steps = np.int32(Tsim/dt) # total number of simulation timesteps
 T = np.int32(Tf/dt) # total number of MPC timesteps
@@ -50,6 +54,25 @@ ops_device = '/GPU:0'
 terminal_only = False
 sigma_sys = 0.2
 precompute = False
+
+image_width = 2
+image_height = 2
+dpi_val = 100
+height_pixels = 152
+width_pixels = 153
+greyscale = False
+if greyscale:
+	channels = 1
+else:
+	channels = 3
+
+X = np.arange(0, a+z, z)
+Y = np.arange(0, a+z, z)
+
+savepath="/home/mpereira30/spdes/TF_code/save_n_log"
+
+points2collect = 60000
+num_repetitions = int(points2collect / (num_gpus * Tsim_steps))
 
 print("")
 print("-----------------------------Parameters-----------------------------")
@@ -243,61 +266,112 @@ U_new = U_input_cpu + delta_U
 config = tf.ConfigProto(allow_soft_placement=True)
 with tf.Session(config=config) as sess:
 
-	h_current = init_sigma * np.random.rand(num_gpus,J-1,J-1)
-	U_current = np.random.randn(num_gpus,T,N)
-	print("")
+	input_images = []
+	training_targets = []
 
-	all_cost = np.zeros((num_gpus,Tsim_steps))
-	for t_sim in range(Tsim_steps):
+	for nr in range(num_repetitions):
 
-		starttime = time()
+		print("Iter:",nr+1,"of",num_repetitions,"\n")
 
-		for _ in range(iters):
+		h_current = init_sigma * np.random.rand(num_gpus,J-1,J-1)
+		U_current = np.random.randn(num_gpus,T,N)
 
-			U_current = sess.run(U_new,
-			feed_dict={
-				h0_input_cpu: h_current,
-				U_input_cpu: U_current,
-			})
+		# all_cost = np.zeros((num_gpus,Tsim_steps))
+		for t_sim in range(Tsim_steps):
 
-		endtime_1 = time()
+			starttime = time()
 
-		# Apply control on actual system:	
-		batch_costs = []
-		for bs in range(num_gpus):
-			h_vec = np.reshape(h_current[bs,:,:].T, [-1,1]) # vec operation
-			v_n = np.dot(np.expand_dims(np.squeeze(U_current[bs,0,:]),0), curly_v_tilde).T # operation : (1 x N) x (N x (J-1)*(J-1)) ---(after transpose)---> ((J-1)*(J-1) x 1)
-			dW_actual = sigma_sys * (2.0 * np.sqrt(dt)/a) * 0.5 * dst(0.5*dst(np.random.randn(J-1,J-1), type=1).T, type=1).T
-			dW_vec = np.reshape(dW_actual.T, [-1,1])
-			h_new = EE_inv.dot(h_vec + v_n*dt + dW_vec) # Propagate system 
-			h_current[bs,:,:] = np.reshape(h_new, (J-1,J-1)).T # Convert from vec to 2D mat for next timestep
-			U_current[bs,:,:] = np.concatenate((U_current[bs,1:,:], np.expand_dims(U_current[bs,-1,:],0)), axis=0) # Warm-start
+			# Convert the input fields into images:
+			h_images = extract_image_from_field(h_current, image_height, image_width, dpi_val, X, Y, num_contour_levels, vmin, vmax, greyscale)
+			if greyscale: # add extra dimension for channels = 1
+				h_images = np.expand_dims(h_images, -1)
 
-			cost = 0
-			for i in range(len(r_x1)):
-				cost = cost + scale_factor * np.sum(np.square(h_d[ r_y1[i]:r_y2[i]+1, r_x1[i]:r_x2[i]+1 ] - h_current[bs, r_y1[i]:r_y2[i]+1, r_x1[i]:r_x2[i]+1 ]))
-			batch_costs.append(cost)
-		batch_costs = np.asarray(batch_costs)
-		
-		endtime_2 = time()
+			h_diff = 0
+			w_diff = 0
+			if h_images.shape[1] != height_pixels:
+				if h_images.shape[1] < height_pixels:
+					h_diff = height_pixels - h_images.shape[1]
+					zeros_filler = np.zeros((h_images.shape[0], h_diff, h_images.shape[2], h_images.shape[3]), dtype='uint8')
+					h_images = np.concatenate((h_images, zeros_filler), 1)
+				else:
+					h_images = h_images[:,:height_pixels,:]
+			
+			if h_images.shape[2] != width_pixels:
+				if h_images.shape[2] < width_pixels:
+					w_diff = width_pixels - h_images.shape[2] 
+					zeros_filler = np.zeros((h_images.shape[0], h_images.shape[1], w_diff, h_images.shape[3]), dtype='uint8')
+					h_images = np.concatenate((h_images, zeros_filler), 2)
+				else:
+					h_images = h_images[:,:,:width_pixels]
 
-		sys.stdout.write("step:{} of {}, c1: {:3f}, c2: {:3f}, c3: {:3f}, c4: {:3f}, c5: {:3f}, c6: {:3f}, c7: {:3f}, c8: {:3f}, iter time: {:.5f}\r".format(t_sim+1, Tsim_steps, 
-						 	    batch_costs[0],\
-						 	    batch_costs[1],\
-						 	    batch_costs[2],\
-						 	    batch_costs[3],\
-						 	    batch_costs[4],\
-						 	    batch_costs[5],\
-						 	    batch_costs[6],\
-						 	    batch_costs[7],\
-						 	    endtime_1 - starttime))
-		sys.stdout.flush()
-		
-		all_cost[:,t_sim] = batch_costs
+			for _ in range(iters):
 
-np.savez('data2plot.npz', all_cost=all_cost)
-plt.figure()
-plt.plot(all_cost.T)
-plt.title('Cost vs timesteps')
-plt.show()
+				U_current = sess.run(U_new,
+				feed_dict={
+					h0_input_cpu: h_current,
+					U_input_cpu: U_current,
+				})
+
+			# store data for training learner:
+			for i in range(num_gpus):
+				training_targets.append(U_current[i,0,:])		
+				input_images.append(h_images[i,:,:,:])			
+
+			# Apply control on actual system:	
+			batch_costs = []
+			for bs in range(num_gpus):
+				h_vec = np.reshape(h_current[bs,:,:].T, [-1,1]) # vec operation
+				v_n = np.dot(np.expand_dims(np.squeeze(U_current[bs,0,:]),0), curly_v_tilde).T # operation : (1 x N) x (N x (J-1)*(J-1)) ---(after transpose)---> ((J-1)*(J-1) x 1)
+				dW_actual = sigma_sys * (2.0 * np.sqrt(dt)/a) * 0.5 * dst(0.5*dst(np.random.randn(J-1,J-1), type=1).T, type=1).T
+				dW_vec = np.reshape(dW_actual.T, [-1,1])
+				h_new = EE_inv.dot(h_vec + v_n*dt + dW_vec) # Propagate system 
+				h_current[bs,:,:] = np.reshape(h_new, (J-1,J-1)).T # Convert from vec to 2D mat for next timestep
+				U_current[bs,:,:] = np.concatenate((U_current[bs,1:,:], np.expand_dims(U_current[bs,-1,:],0)), axis=0) # Warm-start
+
+				cost = 0
+				for i in range(len(r_x1)):
+					cost = cost + scale_factor * np.sum(np.square(h_d[ r_y1[i]:r_y2[i]+1, r_x1[i]:r_x2[i]+1 ] - h_current[bs, r_y1[i]:r_y2[i]+1, r_x1[i]:r_x2[i]+1 ]))
+				batch_costs.append(cost)
+			batch_costs = np.asarray(batch_costs)
+
+			endtime = time()
+
+			sys.stdout.write("step:{}/{}, c1:{:3f}, c2:{:3f}, c3:{:3f}, c4:{:3f}, c5:{:3f}, c6:{:3f}, c7:{:3f}, c8:{:3f}, i_t:{:3f}, hd:{:3f}, wd:{:3f}\r".format(t_sim+1, Tsim_steps, 
+							 	    batch_costs[0],\
+							 	    batch_costs[1],\
+							 	    batch_costs[2],\
+							 	    batch_costs[3],\
+							 	    batch_costs[4],\
+							 	    batch_costs[5],\
+							 	    batch_costs[6],\
+							 	    batch_costs[7],\
+							 	    endtime - starttime,\
+							 	    h_diff,\
+							 	    w_diff))
+			sys.stdout.flush()
+			# all_cost[:,t_sim] = batch_costs
+
+		# Print final costs:
+		print("c1:{:3f}, c2:{:3f}, c3:{:3f}, c4:{:3f}, c5:{:3f}, c6:{:3f}, c7:{:3f}, c8:{:3f}, hd:{:3f}, wd:{:3f}\r".format( 
+							 	    batch_costs[0],\
+							 	    batch_costs[1],\
+							 	    batch_costs[2],\
+							 	    batch_costs[3],\
+							 	    batch_costs[4],\
+							 	    batch_costs[5],\
+							 	    batch_costs[6],\
+							 	    batch_costs[7],\
+							 	    h_diff,\
+							 	    w_diff))
+			
+		print("Saving data ... ")
+		np.savez(savepath+"/training_data.npz", training_targets=training_targets, input_images=input_images)
+
+
+
+# np.savez('data2plot.npz', all_cost=all_cost)
+# plt.figure()
+# plt.plot(all_cost.T)
+# plt.title('Cost vs timesteps')
+# plt.show()
 

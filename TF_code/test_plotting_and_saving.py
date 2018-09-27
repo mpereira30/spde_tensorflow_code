@@ -7,7 +7,6 @@ from matplotlib import cm
 from utils import extract_image_from_field
 import matplotlib as mpl 
 
-# np.savez('data2plot.npz', h_actual=h_actual, X=X, Y=Y, vmax=vmax, vmin=vmin)
 data = np.load('data2plot.npz')
 h_actual = data['h_actual']
 X = data['X']
@@ -17,15 +16,28 @@ vmin = data['vmin']
 
 num_contour_levels = 200
 Tsim_steps = h_actual.shape[0]
-image_width = 5
-image_height = 5
+image_width = 2
+image_height = 2
 dpi_val = 100
 height_pixels = image_height*dpi_val
 width_pixels = image_width*dpi_val
 
 print(h_actual.shape)
-h_images = extract_image_from_field(h_actual, image_height, image_width, dpi_val, X, Y, num_contour_levels, vmin, vmax)
+h_images = extract_image_from_field(h_actual, image_height, image_width, dpi_val, X, Y, num_contour_levels, -0.2, 1.2, greyscale=False)
 print(h_images.shape)
+print(h_images.dtype)
+
+plt.figure()
+plt.imshow(h_images[-1])
+plt.show()
+
+#----------------------------------- Data from running DAgger-----------------------------------
+# data = np.load('save_n_log/pretrain.npz')
+# h_images = data['h0_images']
+
+# plt.figure()
+# plt.imshow(h_images[-1].astype('uint8'))
+# plt.show()
 
 #--------------------------------------------------------------------------------------------------------------------
 # plt.figure()

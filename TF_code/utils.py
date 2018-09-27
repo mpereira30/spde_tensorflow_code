@@ -25,11 +25,12 @@ def remove_whitespaces(img):
 	while(img[y2,x,0]>0):
 		y2-=1
 
-	return img[y1:y2+1, x1:x2+1,:]
+	# return img[y1:y2+1, x1:x2+1,:]
+	return y1,y2,x1,x2
 
-def extract_image_from_field(h, image_height, image_width, dpi_val, X, Y, num_contour_levels, vmin, vmax):
-	height_pixels = image_height*dpi_val
-	width_pixels = image_width*dpi_val	
+def extract_image_from_field(h, image_height, image_width, dpi_val, X, Y, num_contour_levels, vmin, vmax, greyscale):
+	height_pixels = int(image_height*dpi_val)
+	width_pixels = int(image_width*dpi_val)	
 	mpl.rcParams['toolbar']='None'
 	fig = plt.figure(figsize=(image_height, image_width), dpi=dpi_val)
 	plt.axis('off')	
@@ -42,9 +43,18 @@ def extract_image_from_field(h, image_height, image_width, dpi_val, X, Y, num_co
 
 		fig.canvas.draw()
 		img = np.fromstring(fig.canvas.tostring_rgb(), dtype='uint8').reshape(height_pixels, width_pixels, 3)	
-		new_img = remove_whitespaces(img)
+		if i == 0:
+			y1,y2,x1,x2 = remove_whitespaces(img)
+		# new_img = img[y1:y2+1, x1:x2+1,:]
+		new_img = img[y1+1:y2, x1+1:x2,:]
+
+		# Make image greyscale using formula for luminosity (0.21 R + 0.72 G + 0.07 B) :
+		if greyscale:
+			new_img = ( 0.21 * new_img[:,:,0] + 0.72 * new_img[:,:,1] + 0.07 * new_img[:,:,2]).astype('uint8')
 		image_list.append(np.expand_dims(new_img, 0))
 		plt.clf()
 
 	plt.close()
-	return np.concatenate(image_list, 0)
+	image_list = np.concatenate(image_list, 0)
+	return image_list
+
